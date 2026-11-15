@@ -16,10 +16,29 @@ Proton has no Python SDK, so pdrive is two parts:
 
 Needs Python ≥ 3.10 and Node ≥ 22.
 
-```sh
-npm ci --prefix src/pdrive/bridge_js      # SDK + tsx for the bridge
-uv tool install -e .                      # or: pip install -e .   (add [keyring] for keyring support)
-```
+1. Install the bridge's Node dependencies (the Proton SDK and `tsx`):
+
+   ```sh
+   npm ci --prefix src/pdrive/bridge_js
+   ```
+
+2. Install the `pdrive` command. Pick **one** of these:
+
+   ```sh
+   uv tool install -e .                  # password saved to a 0600 file
+   uv tool install -e '.[keyring]'       # password saved to the system keyring
+   ```
+
+   With pip, the same choice is `pip install -e .` or `pip install -e '.[keyring]'`.
+
+`[keyring]` is an optional extra. It installs the [`keyring`](https://pypi.org/project/keyring/) package,
+and `pdrive login` then saves the share password in your desktop's secret store (GNOME Keyring or
+KWallet via the Secret Service). Keep the quotes: without them, zsh treats the `[...]` as a glob pattern.
+
+Without the extra, or when no keyring service is running (for example over SSH or under systemd),
+pdrive falls back to `~/.config/pdrive/credentials`, a file readable only by you (mode 0600). Either way
+the password is never written to the main config file. To force one store, run
+`pdrive config set password_store keyring` (or `file`). See [Settings and credentials](#settings-and-credentials).
 
 ## Quick start
 
