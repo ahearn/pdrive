@@ -144,9 +144,10 @@ two limits:
 
 pdrive works around both:
 
-- It runs up to `bridges` bridge processes (default 8), each with its own session. Extra ones start
-  only when calls begin to queue, so `ls` and other small commands stay at one process.
-- It keeps 8 listings in flight per bridge.
+- It runs up to `bridges` bridge processes (default 8), each with its own session, with at most 8
+  calls in flight on each. Another bridge starts only when all the running ones are full, so `ls` and
+  other small commands stay at one process. A bridge that dies is dropped and its call retried on
+  another. If starting one fails, pdrive stops adding bridges for that run.
 - It lists trees in the background in depth-first output order. `du` and `ls -R` start printing at once,
   and a `listing… N folders` line on stderr shows progress.
 
@@ -171,3 +172,15 @@ PDRIVE_LIVE=1 .venv/bin/pytest -m live   # read-only checks against your logged-
 The core (`drive.py`, `transfer.py`, `config.py`, `cli.py`) only talks to the `Backend` protocol in
 `remote.py`. The tests use an in-memory `FakeBackend` (`tests/conftest.py`). `BridgeBackend`'s JSON-lines
 handling is tested against `tests/fake_bridge.py`. Set `PDRIVE_BRIDGE_DEBUG=1` to see SDK logs.
+
+## License
+
+pdrive is released under the [MIT License](LICENSE).
+
+It depends on Proton's [`@protontech/drive-sdk`](https://www.npmjs.com/package/@protontech/drive-sdk)
+(MIT) and [`@protontech/crypto`](https://www.npmjs.com/package/@protontech/crypto) (GPL-3.0). This
+repository contains neither: npm installs them, and they are git-ignored. The bundle that
+`npm run build` produces (`dist/bridge.mjs`), and any wheel built with it, does contain them. If you
+redistribute that bundle or wheel, its GPL-3.0 terms apply to the bundled code.
+
+This project is not affiliated with or endorsed by Proton AG.

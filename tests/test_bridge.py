@@ -83,3 +83,10 @@ def test_bundle_alone_is_enough(tmp_path):
     (tmp_path / "dist").mkdir()
     (tmp_path / "dist/bridge.mjs").write_text("")
     assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("dist/bridge.mjs")
+
+
+def test_progress_callback_error_does_not_kill_reader(bb, tmp_path):
+    def bad(_):
+        raise ValueError("boom")
+    assert bb.download("x", str(tmp_path / "f"), progress=bad) == 3
+    assert bb.children("a")[0].uid == "a-1"  # reader thread still alive

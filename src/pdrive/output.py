@@ -67,10 +67,20 @@ class StatusLine:
 
     def clear(self) -> None:
         with self._lock:
-            if self._shown:
-                self.stream.write("\r\033[K")
-                self.stream.flush()
-                self._shown = False
+            self._clear()
+
+    def write_through(self, out: TextIO, text: str) -> None:
+        """Clear the status line and write ``text`` to ``out`` without a redraw in between."""
+        with self._lock:
+            self._clear()
+            out.write(text)
+            out.flush()
+
+    def _clear(self) -> None:  # lock held
+        if self._shown:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+            self._shown = False
 
 
 class Reporter:

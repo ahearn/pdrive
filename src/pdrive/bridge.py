@@ -66,12 +66,17 @@ class BridgeBackend:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue  # stray output; the protocol is strictly one JSON object per line
+            if not isinstance(msg, dict):
+                continue
             call = self._calls.get(msg.get("id"))
             if call is None:
                 continue
             if "event" in msg:
                 if call.on_event:
-                    call.on_event(msg)
+                    try:
+                        call.on_event(msg)
+                    except Exception:  # a broken progress callback must not kill the reader
+                        pass
             else:
                 call.response = msg
                 call.done.set()
@@ -149,11 +154,14 @@ class BridgeBackend:
                 self._proc.stdin.close()
             except BrokenPipeError:
                 pass
-        try:
-            self._proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._proc.terminate()
-            self._proc.wait(timeout=5)
+        for stop in (None, self._proc.terminate, self._proc.kill):
+            if stop:
+                stop()
+            try:
+                self._proc.wait(timeout=10 if stop is None else 5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
         self._reader.join(timeout=2)
 
 
@@ -161,94 +169,137 @@ class BridgePool:
     """Backend over several bridge processes, each with its own Proton session.
 
     Listing is CPU-bound: the SDK decrypts every entry's key and name (~18 ms each), and Node does that
-    on one core. Big walks and transfers therefore go to the least-busy of up to ``max_bridges``
-    processes. Extra bridges start lazily, in the background, once calls queue up (``busy`` calls in
-    flight on every bridge), so short commands like ``ls`` run a single process.
+    on one core. Calls therefore go to the least-busy bridge, with at most ``per_bridge`` calls in flight
+    on each. When every bridge is full, callers wait, and another bridge is started in the background
+    (up to ``max_bridges``). Commands that never have more than ``per_bridge`` calls in flight, like
+    ``ls``, never start a second process.
 
-    Changes (mkdir, rename, delete) always use the first bridge. Uploads do too while a rate limit is
-    set, because the limit is enforced per process.
+    - A bridge that dies is dropped and the call retried elsewhere.
+    - If starting an extra bridge fails, the pool stops growing for the rest of the run.
+    - Changes (mkdir, rename, delete) always use the first bridge, and so do uploads while a rate
+      limit is set, because the limit is enforced per process. These calls ignore the per-bridge cap.
     """
 
-    def __init__(self, spawn: Callable[[], Any], max_bridges: int = 8, busy: int = 2):
+    def __init__(self, spawn: Callable[[], Any], max_bridges: int = 8, per_bridge: int = 8):
         self._spawn = spawn
         self.max_bridges = max(1, max_bridges)
-        self.busy = busy
-        self._lock = threading.Lock()
+        self.per_bridge = max(1, per_bridge)
+        self._cv = threading.Condition()
         self._bridges: list[Any] = []
         self._load: dict[int, int] = {}
         self._starting = 0
+        self._grow_failed = False
         self._creds: Optional[tuple[str, str]] = None
         self._rate = 0
         self._closed = False
-        self._growers: list[threading.Thread] = []
 
     @property
     def size(self) -> int:
-        with self._lock:
+        with self._cv:
             return len(self._bridges)
 
     @property
     def primary(self):
-        return self._bridges[0]
+        with self._cv:
+            if not self._bridges:
+                raise RemoteError("bridge", "not authenticated")
+            return self._bridges[0]
 
     def auth(self, url: str, password: str) -> Node:
+        with self._cv:
+            if self._bridges or self._closed:
+                raise PdriveError("bridge pool already in use; create a new one")
         b = self._spawn()
         try:
             root = b.auth(url, password)
         except Exception:
             b.close()
             raise
-        with self._lock:
+        with self._cv:
             self._creds = (url, password)
             self._bridges = [b]
             self._load = {id(b): 0}
         return root
 
+    # -- growth and selection -------------------------------------------------
     def _grow(self) -> None:
         b = None
         try:
             b = self._spawn()
             assert self._creds is not None
             b.auth(*self._creds)
+            if self._rate:
+                b.set_rate_limit(self._rate)
         except Exception:  # an extra bridge is an optimisation; carry on with the ones we have
             if b is not None:
                 b.close()
-            b = None
-        with self._lock:
+            with self._cv:
+                self._starting -= 1
+                self._grow_failed = True  # don't hammer Proton's login endpoint with retries
+                self._cv.notify_all()
+            return
+        with self._cv:
             self._starting -= 1
-            if b is not None and not self._closed:
+            if not self._closed:
                 self._bridges.append(b)
                 self._load[id(b)] = 0
                 b = None
-        if b is not None:  # pool closed while this bridge was starting
+            self._cv.notify_all()
+        if b is not None:  # the pool was closed while this bridge was starting
             b.close()
 
     def _acquire(self, spread: bool):
-        with self._lock:
-            if self._closed or not self._bridges:
-                raise RemoteError("bridge", "not authenticated")
-            b = min(self._bridges, key=lambda x: self._load[id(x)]) if spread else self._bridges[0]
-            if (spread and self._load[id(b)] >= self.busy
-                    and len(self._bridges) + self._starting < self.max_bridges):
-                self._starting += 1
-                t = threading.Thread(target=self._grow, name="pdrive-bridge-start", daemon=True)
-                self._growers.append(t)
-                t.start()
+        with self._cv:
+            while True:
+                if self._closed or not self._bridges:
+                    raise RemoteError("bridge", "not authenticated")
+                if not spread:
+                    b = self._bridges[0]
+                    break
+                b = min(self._bridges, key=lambda x: self._load[id(x)])
+                if self._load[id(b)] < self.per_bridge:
+                    break
+                if not self._grow_failed and len(self._bridges) + self._starting < self.max_bridges:
+                    self._starting += 1
+                    threading.Thread(target=self._grow, name="pdrive-bridge-start", daemon=True).start()
+                self._cv.wait()
             self._load[id(b)] += 1
             return b
 
-    def _use(self, fn: Callable[[Any], Any], spread: bool = True):
-        b = self._acquire(spread)
-        try:
-            return fn(b)
-        finally:
-            with self._lock:
+    def _release(self, b) -> None:
+        with self._cv:
+            if id(b) in self._load:
                 self._load[id(b)] -= 1
+            self._cv.notify_all()
+
+    def _drop(self, b) -> bool:
+        """Remove a dead extra bridge. Returns False for the first bridge, which can't be replaced."""
+        with self._cv:
+            if not self._bridges or b is self._bridges[0] or b not in self._bridges:
+                return False
+            self._bridges.remove(b)
+            self._load.pop(id(b), None)
+            self._cv.notify_all()
+        threading.Thread(target=b.close, daemon=True).start()
+        return True
+
+    def _use(self, fn: Callable[[Any], Any], spread: bool = True):
+        while True:
+            b = self._acquire(spread)
+            try:
+                return fn(b)
+            except RemoteError as e:
+                if e.code == "bridge" and self._drop(b):
+                    continue  # that bridge died; retry on another one
+                raise
+            finally:
+                self._release(b)
 
     # -- Backend -------------------------------------------------------------
     def set_rate_limit(self, bytes_per_sec: int) -> None:
-        self._rate = int(bytes_per_sec)
         self._use(lambda b: b.set_rate_limit(bytes_per_sec), spread=False)
+        with self._cv:
+            self._rate = int(bytes_per_sec)
 
     def children(self, uid: str) -> list[Node]:
         return self._use(lambda b: b.children(uid))
@@ -267,14 +318,19 @@ class BridgePool:
         return self._use(lambda b: b.download(uid, local_path, progress))
 
     def upload(self, parent_uid: str, name: str, local_path: str, **kw) -> Node:
-        return self._use(lambda b: b.upload(parent_uid, name, local_path, **kw), spread=not self._rate)
+        with self._cv:
+            spread = not self._rate
+        return self._use(lambda b: b.upload(parent_uid, name, local_path, **kw), spread=spread)
 
     def close(self) -> None:
-        with self._lock:
+        """Close all bridges. Doesn't wait for bridges still starting: they close themselves when they
+        see the pool is closed, and they exit anyway when this process ends (stdin EOF)."""
+        with self._cv:
             self._closed = True
             bridges, self._bridges = self._bridges, []
+            self._cv.notify_all()
         closers = [threading.Thread(target=b.close) for b in bridges]
         for t in closers:
             t.start()
-        for t in closers + self._growers:
-            t.join(15)
+        for t in closers:
+            t.join(20)

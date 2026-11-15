@@ -182,7 +182,7 @@ def run_put(drive: Drive, plan: PutPlan, reporter: Reporter, *, policy: Policy =
                 return
             verb = "replace" if action is Action.REPLACE else "upload"
             if dry_run:
-                reporter.finished(task_id, 0, f"would {verb} {up.local} -> {up.remote_path}")
+                reporter.finished(task_id, up.size, f"would {verb} {up.local} -> {up.remote_path}")
                 return
             assert parent is not None
             node = run_with_retry(
@@ -288,7 +288,7 @@ def run_get(drive: Drive, plan: GetPlan, reporter: Reporter, *, policy: Policy =
                                        f"(local {local_size}, remote {dl.node.size}); use -u or -f to overwrite")
                 return
             if dry_run:
-                reporter.finished(task_id, 0, f"would download {dl.remote_path} -> {dl.local}")
+                reporter.finished(task_id, dl.node.size or 0, f"would download {dl.remote_path} -> {dl.local}")
                 return
             if not os.path.isdir(os.path.dirname(dl.local) or "."):
                 raise PdriveError(f"{os.path.dirname(dl.local)}: No such directory")

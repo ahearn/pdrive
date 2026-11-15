@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, Iterator, Optional
 
 from . import remote
-from .remote import Backend, Node, PdriveError
+from .remote import Backend, Node, PdriveError, RemoteError
 
 
 class NotFound(PdriveError):
@@ -149,9 +149,12 @@ class Drive:
             ps = remote.parts(p)
             for i in range(len(ps)):
                 by_depth.setdefault(i, set()).add("/" + "/".join(ps[:i]))
-        for depth in sorted(by_depth):
-            nodes = [n for n in (self._try_lookup(p) for p in by_depth[depth]) if n is not None and n.is_dir]
-            self.list_many(nodes)
+        try:  # only warms the cache: a failure here resurfaces, per file, when the work runs
+            for depth in sorted(by_depth):
+                nodes = [n for n in (self._try_lookup(p) for p in by_depth[depth]) if n is not None and n.is_dir]
+                self.list_many(nodes)
+        except PdriveError:
+            pass
 
     def _try_lookup(self, path: str) -> Optional[Node]:
         try:
@@ -236,7 +239,18 @@ class Drive:
                 if parents and existing.is_dir:
                     return existing
                 raise PdriveError(f"{remote.normpath(path)}: File exists")
-            node = self.backend.mkdir(parent.uid, name)
+            try:
+                node = self.backend.mkdir(parent.uid, name)
+            except RemoteError as e:
+                if not (parents and e.code == "exists"):
+                    raise
+                # Another process created it meanwhile: re-list the parent and use that folder.
+                with self._lock:
+                    self._children.pop(parent.uid, None)
+                existing = self.child(parent, name)
+                if existing is None or not existing.is_dir:
+                    raise
+                return existing
             self._add(parent, node)
             with self._lock:
                 self._children[node.uid] = []

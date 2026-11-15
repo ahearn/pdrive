@@ -86,7 +86,7 @@ class Backend(Protocol):
 def normpath(path: str) -> str:
     """Normalise a remote path to an absolute form. Remote paths are always relative to the share root,
     so ``Movies/A`` and ``/Movies/A/`` are the same folder."""
-    p = posixpath.normpath("/" + (path or "").strip())
+    p = posixpath.normpath("/" + (path or ""))  # no strip(): names may start or end with spaces
     if p.startswith("//"):
         p = "/" + p.lstrip("/")
     return p

@@ -51,8 +51,7 @@ class App:
 
     def out(self, text: str) -> None:
         """Write to stdout, first clearing any transient status line on the terminal."""
-        self.status.clear()
-        self.stdout.write(text)
+        self.status.write_through(self.stdout, text)
 
     def _kr(self) -> dict:
         return {"keyring_loader": self.keyring_loader} if self.keyring_loader is not None else {}
@@ -120,7 +119,14 @@ def cmd_login(app: App) -> int:
         app.info(f"logged in to share {root.name!r}; URL saved, password not saved")
     else:
         store = app.settings.store(**app._kr())
-        store.set(url, password)
+        try:
+            store.set(url, password)
+        except Exception as e:  # e.g. the keyring is locked or its service isn't running
+            if app.settings.get("password_store") == "keyring":
+                raise PdriveError(f"could not save the password to the keyring: {e}") from None
+            app.err(f"warning: keyring failed ({e}); saving the password to a private file instead")
+            store = FileCredentialStore(app.cfg.dir)
+            store.set(url, password)
         where = "keyring" if store.name == "keyring" else str(app.cfg.dir / "credentials")
         app.info(f"logged in to share {root.name!r}; password saved to {where}")
     return 0
@@ -232,6 +238,8 @@ def cmd_du(app: App) -> int:
     a = app.args
     status = 0
     fmt = human if a.human_readable else str
+    if a.max_depth is not None and a.max_depth < 0:
+        raise UsageError("du: --max-depth must be 0 or more")
     with app.drive() as d:
         for p in a.paths or ["/"]:
             p = remote.normpath(p)
@@ -474,8 +482,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("sources", nargs="+", metavar=src)
         sp.add_argument("dest", metavar=dst, help="destination; must be an existing folder when there are several sources")
         sp.add_argument("-r", "-R", "--recursive", action="store_true", help=f"{verb} folders recursively")
-        sp.add_argument("-u", "--update", action="store_true", help="replace existing files whose size differs")
-        sp.add_argument("-f", "--force", action="store_true", help="replace existing files even if the size matches")
+        policy = sp.add_mutually_exclusive_group()
+        policy.add_argument("-u", "--update", action="store_true", help="replace existing files whose size differs")
+        policy.add_argument("-f", "--force", action="store_true", help="replace existing files even if the size matches")
         sp.add_argument("-n", "--dry-run", action="store_true", help=f"show what would {verb}")
         sp.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel transfers (default: config 'jobs', 4)")
         sp.add_argument("--exclude", action="append", default=[], metavar="GLOB",
@@ -498,10 +507,12 @@ def main(argv: Optional[list[str]] = None, **app_kw) -> int:
     except KeyboardInterrupt:
         app.stderr.write("\n")
         return 130
-    except BrokenPipeError:  # e.g. pdrive ls | head
+    except BrokenPipeError:  # e.g. pdrive ls | head: the reader has what it wanted
         try:
-            sys.stdout = open(os.devnull, "w")
-        except OSError:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except (OSError, ValueError):
             pass
         return 0
     except PdriveError as e:

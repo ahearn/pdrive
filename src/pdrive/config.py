@@ -10,8 +10,10 @@ Precedence for every value: command-line flag > environment variable > config fi
 from __future__ import annotations
 
 import configparser
+import io
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol
@@ -75,6 +77,25 @@ KEYS: dict[str, Key] = {k.name: k for k in [
 ]}
 
 
+def _write_private(path: Path, cp: configparser.ConfigParser) -> None:
+    """Atomically write an INI file readable only by the user. The share URL in ``config`` holds the
+    link's key, so it's as sensitive as the password. Uses a unique temp file (no fixed name to race
+    on or to plant a symlink at)."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)  # also tightens a directory made by an older version
+    buf = io.StringIO()
+    cp.write(buf)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")  # mode 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(buf.getvalue())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def config_dir(env: Mapping[str, str] = os.environ) -> Path:
     if env.get("PDRIVE_CONFIG_DIR"):
         return Path(env["PDRIVE_CONFIG_DIR"])
@@ -119,11 +140,7 @@ class ConfigFile:
         return removed
 
     def _write(self, cp: configparser.ConfigParser) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            cp.write(f)
-        os.replace(tmp, self.path)
+        _write_private(self.path, cp)
 
 
 # -- credentials -----------------------------------------------------------------
@@ -169,13 +186,7 @@ class FileCredentialStore:
         return removed
 
     def _write(self, cp: configparser.ConfigParser) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            cp.write(f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        _write_private(self.path, cp)
 
 
 class KeyringCredentialStore:

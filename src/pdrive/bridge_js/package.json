@@ -1,6 +1,7 @@
 {
   "name": "pdrive-bridge",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Node helper for pdrive: JSON-lines wrapper around @protontech/drive-sdk",
   "dependencies": {

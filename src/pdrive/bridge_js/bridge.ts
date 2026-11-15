@@ -225,7 +225,13 @@ const ops: Record<string, Op> = {
       const controller = await uploader.uploadFromStream(stream, [], (bytes: number) =>
         emit({ event: "progress", bytes }));
       const result = await controller.completion();
-      return nodeJson(await pub.getNode(result.nodeUid));
+      try {
+        return nodeJson(await pub.getNode(result.nodeUid));
+      } catch {
+        // The upload is done; don't report it as failed (a retry would then hit "already exists").
+        return { uid: result.nodeUid, name: req.name, type: "file", size: req.size, mtime: req.mtime ?? null,
+                 media_type: metadata.mediaType };
+      }
     });
   },
 };

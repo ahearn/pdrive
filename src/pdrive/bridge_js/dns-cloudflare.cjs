@@ -1,5 +1,5 @@
 // Preload (node --require): resolve hostnames via Cloudflare instead of the system resolver,
-// for when the router's DNS (192.168.50.1) stops answering. Only affects this Node process.
+// for when the local router's DNS stops answering. Only affects this Node process.
 const dns = require('dns');
 const resolver = new dns.Resolver({ timeout: 3000, tries: 3 });
 resolver.setServers(['1.1.1.1', '1.0.0.1']);

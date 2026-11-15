@@ -93,7 +93,7 @@ def _hold_primary_busy(pool, instances):
 # --------------------------------------------------------------------------
 def test_single_call_uses_one_bridge():
     instances: list[FakeBridge] = []
-    pool = BridgePool(spawn=_make_spawn(instances), max_bridges=4, busy=5)
+    pool = BridgePool(spawn=_make_spawn(instances), max_bridges=4, per_bridge=5)
     pool.auth("http://x", "pw")
     for _ in range(3):
         pool.children("root")
@@ -115,7 +115,7 @@ def test_grows_under_load_up_to_max():
         instances.append(b)
         return b
 
-    pool = BridgePool(spawn=spawn, max_bridges=3, busy=1)
+    pool = BridgePool(spawn=spawn, max_bridges=3, per_bridge=1)
     pool.auth("http://x", "pw")
     instances[0].children_gate = gate
 
@@ -157,7 +157,7 @@ def test_changes_go_to_primary():
         instances.append(b)
         return b
 
-    pool = BridgePool(spawn=spawn, max_bridges=3, busy=1)
+    pool = BridgePool(spawn=spawn, max_bridges=3, per_bridge=1)
     pool.auth("http://x", "pw")
     instances[0].children_gate = gate
 
@@ -211,7 +211,7 @@ def test_rate_limit_pins_uploads_to_primary():
         instances.append(b)
         return b
 
-    pool = BridgePool(spawn=spawn, max_bridges=3, busy=1)
+    pool = BridgePool(spawn=spawn, max_bridges=3, per_bridge=1)
     pool.auth("http://x", "pw")
     instances[0].children_gate = gate
 
@@ -236,8 +236,8 @@ def test_rate_limit_pins_uploads_to_primary():
     upload_threads = []
     for i in range(4):
         t = threading.Thread(
-            target=lambda: pool.upload("root", f"f{i}", "/tmp/f{i}",
-                                       size=10, mtime=None, media_type="text/plain")
+            target=lambda i=i: pool.upload("root", f"f{i}", f"/tmp/f{i}",
+                                           size=10, mtime=None, media_type="text/plain")
         )
         t.start()
         upload_threads.append(t)
@@ -249,7 +249,7 @@ def test_rate_limit_pins_uploads_to_primary():
     holder.join(timeout=5)
     primary = pool.primary
     upload_calls_on_primary = [c for c in primary.calls if c[0] == "upload"]
-    assert len(upload_calls_on_primary) == 4
+    assert sorted(c[2] for c in upload_calls_on_primary) == ["f0", "f1", "f2", "f3"]
     for b in instances[1:]:
         assert not any(c[0] == "upload" for c in b.calls)
 
@@ -269,7 +269,7 @@ def test_failed_extra_bridge_is_ignored():
         instances.append(b)
         return b
 
-    pool = BridgePool(spawn=spawn, max_bridges=3, busy=1)
+    pool = BridgePool(spawn=spawn, max_bridges=3, per_bridge=1)
     pool.auth("http://x", "pw")
 
     # Generate load that would trigger _grow; the extra bridges will fail
@@ -292,6 +292,19 @@ def test_failed_extra_bridge_is_ignored():
     result = pool.children("root")
     assert isinstance(result, list)
     assert pool.size == 1
+    # Growth was attempted, but after the first failure the pool stops trying (no login hammering).
+    # Waiters that queued before the failure may each have started one attempt: at most max - 1.
+    assert 2 <= spawn_count[0] <= 3
+    before = spawn_count[0]
+    gate.clear()
+    more = [threading.Thread(target=lambda: pool.children("root")) for _ in range(6)]
+    for t in more:
+        t.start()
+    time.sleep(0.05)
+    gate.set()
+    for t in more:
+        t.join(timeout=5)
+    assert spawn_count[0] == before
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +324,7 @@ def test_close_closes_all():
         instances.append(b)
         return b
 
-    pool = BridgePool(spawn=spawn, max_bridges=2, busy=1)
+    pool = BridgePool(spawn=spawn, max_bridges=2, per_bridge=1)
     pool.auth("http://x", "pw")
 
     # Make primary busy so _acquire triggers _grow
@@ -342,6 +355,7 @@ def test_close_closes_all():
     unblocker.join(timeout=5)
 
     assert len(instances) == 2
+    assert _poll_until(lambda: all(b.closed for b in instances), timeout=5.0)
     for b in instances:
         assert b.closed, f"bridge was not closed: {b.calls}"
         assert ("close",) in b.calls
@@ -367,3 +381,74 @@ def test_auth_failure_closes_bridge():
     assert len(instances) == 1
     assert instances[0].closed
     assert ("close",) in instances[0].calls
+
+
+def test_small_load_stays_on_one_bridge():
+    """Up to per_bridge concurrent calls never start a second process (ls, small gets)."""
+    instances: list[FakeBridge] = []
+    gate = threading.Event()
+
+    def spawn():
+        b = FakeBridge(children_gate=gate)
+        instances.append(b)
+        return b
+
+    pool = BridgePool(spawn=spawn, max_bridges=4, per_bridge=3)
+    pool.auth("http://x", "pw")
+    threads = [threading.Thread(target=lambda: pool.children("root")) for _ in range(3)]
+    for t in threads:
+        t.start()
+    assert _poll_until(lambda: len([c for c in instances[0].calls if c[0] == "children"]) == 3)
+    gate.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert len(instances) == 1
+
+
+def test_dead_extra_bridge_is_dropped_and_call_retried():
+    instances: list[FakeBridge] = []
+    gate = threading.Event()
+
+    def spawn():
+        b = FakeBridge(children_gate=gate)
+        instances.append(b)
+        return b
+
+    pool = BridgePool(spawn=spawn, max_bridges=2, per_bridge=1)
+    pool.auth("http://x", "pw")
+    holder = threading.Thread(target=lambda: pool.children("root"))  # fills the primary
+    holder.start()
+    waiter = threading.Thread(target=lambda: pool.children("root"))  # starts and uses bridge 2
+    waiter.start()
+    assert _poll_until(lambda: pool.size == 2)
+    gate.set()
+    holder.join(timeout=5)
+    waiter.join(timeout=5)
+
+    def dead(uid):
+        raise RemoteError("bridge", "bridge process exited")
+    instances[1].children = dead
+    instances[0].children_gate = None
+    # Least-busy picks the primary first (ties go to the first bridge); make it busy so the dead
+    # bridge is chosen, which must then be dropped and the call retried on the primary.
+    hold = threading.Event()
+    instances[0].children_gate = hold
+    parked = threading.Thread(target=lambda: pool.children("root"))
+    parked.start()
+    assert _poll_until(lambda: pool._load[id(instances[0])] == 1)
+    result = []
+    t = threading.Thread(target=lambda: result.append(pool.children("root")))
+    t.start()
+    assert _poll_until(lambda: pool.size == 1)  # dead bridge dropped
+    hold.set()
+    t.join(timeout=5)
+    parked.join(timeout=5)
+    assert result and result[0][0].uid == "c1"
+    assert _poll_until(lambda: instances[1].closed)
+
+
+def test_second_auth_is_refused():
+    pool = BridgePool(spawn=lambda: FakeBridge(), max_bridges=2)
+    pool.auth("http://x", "pw")
+    with pytest.raises(Exception, match="already in use"):
+        pool.auth("http://x", "pw")

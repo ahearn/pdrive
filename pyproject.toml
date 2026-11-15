@@ -3,6 +3,8 @@ name = "pdrive"
 version = "0.1.0"
 description = "Command-line access to a Proton Drive public share link (wraps the official Drive SDK)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = []
 
