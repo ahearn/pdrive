@@ -71,9 +71,11 @@ Remote paths are always relative to the share root; `Movies`, `/Movies` and `/Mo
 | `rm [-r] [-f] [-i] [-n] PATH...` | Delete **permanently**, with no trash |
 | `put [-r] [-u\|-f] [-n] [-p] [-j N] [--limit-rate R] [--exclude GLOB] LOCAL... REMOTE` | Upload |
 | `get [-r] [-u\|-f] [-n] [-j N] [--exclude GLOB] REMOTE... LOCAL` | Download |
+| `flush-cache` | Empty the [listing cache](#listing-cache) |
+| `--mcp [--port N]` | Run the [MCP server](#mcp-server) instead of a command |
 
 Global flags: `-v` reports each file, `-q` silences progress and the summary. Both work before or after
-the command. Other global flags: `--share-url`, `--config-dir`, `--version`.
+the command. Other global flags: `--share-url`, `--config-dir`, `--cache-ttl MIN`, `--no-cache`, `--version`.
 
 ### Copy semantics (`put`, `get`)
 
@@ -113,6 +115,9 @@ Settings live in `~/.config/pdrive/config` (or `$XDG_CONFIG_HOME/pdrive`, or `$P
 | `share_url` | `PDRIVE_SHARE_URL` | – | set by `login` |
 | `jobs` | `PDRIVE_JOBS` | 4 | parallel transfers (the SDK runs at most 5 per session) |
 | `bridges` | `PDRIVE_BRIDGES` | 8 | max bridge processes; see [Performance](#performance) |
+| `cache_ttl` | `PDRIVE_CACHE_TTL` | 30 | minutes the listing cache stays warm after the last use (`--cache-ttl`) |
+| `mcp_port` | `PDRIVE_MCP_PORT` | 14912 | port for `pdrive --mcp` (`--port`) |
+| `refresh_interval` | `PDRIVE_REFRESH_INTERVAL` | 60 | seconds between background re-lists in the MCP server |
 | `limit_rate` | `PDRIVE_LIMIT_RATE` | 0 | upload cap, e.g. `20M` (bytes/s) |
 | `dns` | `PDRIVE_DNS` | system | `cloudflare` resolves via 1.1.1.1, for when the router's DNS flakes |
 | `node` | `PDRIVE_NODE` | PATH, then fnm default | node binary |
@@ -124,6 +129,40 @@ Precedence is: command-line flag, then environment, then config file, then defau
 optional `keyring` package has a working backend. Otherwise it goes to `~/.config/pdrive/credentials`,
 mode `0600`. `PDRIVE_PASSWORD` overrides any saved password, which is useful for scripts. `--no-store`
 saves only the URL, and pdrive then prompts for the password whenever stdin is a terminal.
+
+## Listing cache
+
+Folder listings are kept in SQLite at `~/.cache/pdrive/cache.sqlite` (or `$XDG_CACHE_HOME/pdrive`, or
+`$PDRIVE_CACHE_DIR`), shared by the CLI and the MCP server. The file is mode `0600`, and it stores a
+hash of the share URL, never the URL itself.
+
+- **Warm for 30 minutes after the last use.** Any command or MCP call counts as a use. Once the cache
+  goes cold, the next use starts again from empty. Change the window with `--cache-ttl MIN` or
+  `pdrive config set cache_ttl MIN`.
+- **Trusted until it expires.** With a warm cache, `ls`, `du` and `stat` answer from SQLite without
+  starting a bridge or logging in. pdrive's own `put`, `mkdir`, `rename` and `rm` update the cache. Changes made
+  elsewhere (the web app, another device) show up after expiry or after `pdrive flush-cache`.
+- `--no-cache` skips the cache for one command.
+
+## MCP server
+
+`pdrive --mcp` serves the share to Claude (or any MCP client) over streamable HTTP at
+`http://127.0.0.1:14912/mcp`. It listens on localhost only, with no authentication, so anything running
+as any user on this machine can reach it. Requests with a non-loopback `Host` or `Origin` header are
+rejected, so a web page can't reach the server through DNS rebinding. It logs in at startup and prints how to connect:
+
+```sh
+pdrive --mcp                 # or: pdrive --mcp --port 15000 --cache-ttl 60
+claude mcp add --transport http pdrive http://127.0.0.1:14912/mcp   # add --scope user for every project
+```
+
+Tools: `ls`, `stat`, `du`, `search`, `get`, `put`, `mkdir`, `flush_cache` and `cache_status`. Deleting and
+renaming are deliberately not exposed. `get` writes to this machine's disk, so Claude Code asks before it runs.
+
+While the cache is warm, the server re-lists one folder per minute in the background (`refresh_interval`).
+It picks stale folders near the paths used most recently, so the area you're working in stays fresh
+without flooding Proton. When the cache goes cold, the server closes its Proton sessions and logs in
+again on the next call.
 
 ## Limitations (from Proton, not pdrive)
 

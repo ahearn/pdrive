@@ -5,10 +5,13 @@ import heapq
 import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional
 
 from . import remote
 from .remote import Backend, Node, PdriveError, RemoteError
+
+if TYPE_CHECKING:
+    from .cache import CacheStore
 
 
 class NotFound(PdriveError):
@@ -33,9 +36,9 @@ class _Prefetcher:
     subtrees a depth-first consumer (du, ls -R, a recursive get) needs first are finished first. The
     consumer can print as it goes instead of waiting for the whole tree."""
 
-    def __init__(self, drive: "Drive", root: Node, jobs: int):
+    def __init__(self, drive: "Drive", root: Node, jobs: int, path: Optional[str] = None):
         self.drive = drive
-        self.heap: list[tuple[tuple[int, ...], int, Node]] = [((), 0, root)]
+        self.heap: list[tuple[tuple[int, ...], int, Node, Optional[str]]] = [((), 0, root, path)]
         self.seq = itertools.count(1)
         self.cv = threading.Condition()
         self.active = 0
@@ -58,24 +61,28 @@ class _Prefetcher:
                 if self.stopped or not self.heap:  # stopped, or the whole tree is listed
                     self.cv.notify_all()
                     return
-                key, _, node = heapq.heappop(self.heap)
+                key, _, node, path = heapq.heappop(self.heap)
                 self.active += 1
             try:
-                kids = self.drive.listdir(node)
+                kids = self.drive.listdir(node, path)
             except Exception:  # the consumer lists this folder itself and reports the error
                 kids = []
             with self.cv:
                 for i, kid in enumerate(kids):
                     if kid.is_dir:
-                        heapq.heappush(self.heap, (key + (i,), next(self.seq), kid))
+                        kid_path = remote.join(path, kid.name) if path is not None else None
+                        heapq.heappush(self.heap, (key + (i,), next(self.seq), kid, kid_path))
                 self.active -= 1
                 self.cv.notify_all()
 
 
 class Drive:
-    def __init__(self, backend: Backend, root: Node, list_jobs: int = LIST_JOBS):
+    def __init__(self, backend: Backend, root: Node, list_jobs: int = LIST_JOBS,
+                 store: Optional["CacheStore"] = None):
         self.backend = backend
         self.root = root
+        self.store = store  # persistent listing cache shared with other pdrive processes, or None
+        self.cache_hits = 0
         self.list_jobs = list_jobs
         self.on_list: Optional[Callable[[int], None]] = None  # called with the running count of listings
         self.listed = 0
@@ -89,9 +96,10 @@ class Drive:
         self._mkdir_lock = threading.RLock()  # serialises folder creation (check-then-create)
 
     # -- listing --------------------------------------------------------------
-    def listdir(self, node: Node) -> list[Node]:
+    def listdir(self, node: Node, path: Optional[str] = None) -> list[Node]:
         """Children of a folder, sorted by name. Each folder is listed at most once at a time; callers
-        that ask for a folder already being listed wait for that listing."""
+        that ask for a folder already being listed wait for that listing. ``path`` (when known) is
+        stored with the cached listing so the background refresher can focus on recent paths."""
         if not node.is_dir:
             raise NotADirectory(node.name)
         while True:
@@ -108,7 +116,15 @@ class Drive:
                 event.wait()
                 continue  # now cached, or the other lister failed and this caller tries itself
             try:
+                hit = self.store.get_listing(node.uid) if self.store else None
+                if hit is not None:
+                    with self._lock:
+                        self._children.setdefault(node.uid, hit[0])
+                        self.cache_hits += 1
+                    continue
                 kids = sorted(self.backend.children(node.uid), key=lambda n: n.name)
+                if self.store:
+                    self.store.put_listing(node.uid, kids, path)
                 with self._lock:
                     # Changed while listing (e.g. an upload finished)? Then loop and list again.
                     if node.uid not in self._children and self._changes.get(node.uid, 0) == seen:
@@ -122,10 +138,10 @@ class Drive:
                     self._inflight.pop(node.uid, None)
                 event.set()
 
-    def start_prefetch(self, folder: Node) -> None:
+    def start_prefetch(self, folder: Node, path: Optional[str] = None) -> None:
         """List ``folder``'s whole tree in the background (see _Prefetcher). Returns immediately."""
         if folder.is_dir:
-            self._prefetchers.append(_Prefetcher(self, folder, self.list_jobs))
+            self._prefetchers.append(_Prefetcher(self, folder, self.list_jobs, path))
 
     def stop(self) -> None:
         """Stop background listing (call before closing the backend)."""
@@ -163,7 +179,10 @@ class Drive:
             return None
 
     def child(self, folder: Node, name: str) -> Optional[Node]:
-        for n in self.listdir(folder):
+        return self._child_at(folder, None, name)
+
+    def _child_at(self, folder: Node, folder_path: Optional[str], name: str) -> Optional[Node]:
+        for n in self.listdir(folder, folder_path):
             if n.name == name:
                 return n
         return None
@@ -174,7 +193,7 @@ class Drive:
         for part in remote.parts(path):
             if not node.is_dir:
                 raise NotADirectory(walked)
-            nxt = self.child(node, part)
+            nxt = self._child_at(node, walked, part)
             if nxt is None:
                 return None
             node, walked = nxt, remote.join(walked, part)
@@ -189,11 +208,11 @@ class Drive:
     def walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
         """Yield (path, node) for every descendant of a folder, depth first, parents before children.
         The tree is listed in parallel in the background, so results start arriving right away."""
-        self.start_prefetch(node)
+        self.start_prefetch(node, remote.normpath(path))
         yield from self._walk(node, path)
 
     def _walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
-        for kid in self.listdir(node):
+        for kid in self.listdir(node, remote.normpath(path)):
             kid_path = remote.join(path, kid.name)
             yield kid_path, kid
             if kid.is_dir:
@@ -206,6 +225,8 @@ class Drive:
 
     # -- mutation (keeps the cache coherent) -----------------------------------
     def _add(self, parent: Node, node: Node) -> None:
+        if self.store:
+            self.store.add_child(parent.uid, node)
         with self._lock:
             self._changes[parent.uid] = self._changes.get(parent.uid, 0) + 1
             if parent.uid in self._children:
@@ -213,6 +234,8 @@ class Drive:
                 self._children[parent.uid] = sorted(kids, key=lambda n: n.name)
 
     def _remove(self, parent_uid: str, uid: str) -> None:
+        if self.store:
+            self.store.remove_child(parent_uid, uid)
         with self._lock:
             self._changes[parent_uid] = self._changes.get(parent_uid, 0) + 1
             if parent_uid in self._children:
@@ -245,8 +268,7 @@ class Drive:
                 if not (parents and e.code == "exists"):
                     raise
                 # Another process created it meanwhile: re-list the parent and use that folder.
-                with self._lock:
-                    self._children.pop(parent.uid, None)
+                self.forget(parent.uid)
                 existing = self.child(parent, name)
                 if existing is None or not existing.is_dir:
                     raise
@@ -254,6 +276,8 @@ class Drive:
             self._add(parent, node)
             with self._lock:
                 self._children[node.uid] = []
+            if self.store:
+                self.store.put_listing(node.uid, [], remote.normpath(path))
             return node
 
     def rename(self, path: str, new_name: str) -> Node:
@@ -286,6 +310,29 @@ class Drive:
                     self._remove(parent.uid, node.uid)
             out.append((path, err))
         return out
+
+    def forget(self, folder_uid: str) -> None:
+        """Drop one folder's listing from both caches, so the next use lists it from Proton."""
+        with self._lock:
+            self._children.pop(folder_uid, None)
+            self._changes[folder_uid] = self._changes.get(folder_uid, 0) + 1
+        if self.store:
+            self.store.forget_listing(folder_uid)
+
+    def refresh(self, folder_uid: str) -> list[Node]:
+        """List a folder from Proton even if cached, and store the result (background refresher)."""
+        kids = sorted(self.backend.children(folder_uid), key=lambda n: n.name)
+        if self.store:
+            self.store.put_listing(folder_uid, kids)
+        with self._lock:
+            self._children[folder_uid] = kids
+        return kids
+
+    def flush_cache(self) -> int:
+        """Forget every cached listing, in memory and on disk. Returns how many were on disk."""
+        with self._lock:
+            self._children.clear()
+        return self.store.flush() if self.store else 0
 
     def record_upload(self, parent: Node, node: Node) -> None:
         self._add(parent, node)

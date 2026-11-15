@@ -176,3 +176,9 @@ def tree(tmp_path):
 @pytest.fixture
 def no_sleep():
     return lambda s: None
+
+
+@pytest.fixture(autouse=True)
+def _private_cache_dir(tmp_path, monkeypatch):
+    """Never let a test read or write the user's real listing cache (~/.cache/pdrive)."""
+    monkeypatch.setenv("PDRIVE_CACHE_DIR", str(tmp_path / "cache-autouse"))
