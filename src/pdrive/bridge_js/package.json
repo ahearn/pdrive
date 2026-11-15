@@ -1,0 +1,11 @@
+{
+  "name": "pdrive-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Node helper for pdrive: JSON-lines wrapper around @protontech/drive-sdk",
+  "dependencies": {
+    "@protontech/crypto": "2.1.3",
+    "@protontech/drive-sdk": "0.21.3",
+    "tsx": "4.23.15"
+  }
+}

@@ -1,0 +1,28 @@
+[project]
+name = "pdrive"
+version = "0.1.0"
+description = "Command-line access to a Proton Drive public share link (wraps the official Drive SDK)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+keyring = ["keyring>=24"]
+
+[project.scripts]
+pdrive = "pdrive.cli:main_entry"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdrive"]
+exclude = ["src/pdrive/bridge_js/node_modules"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: talks to a real Proton share (needs PDRIVE_LIVE=1 and a saved login)"]
