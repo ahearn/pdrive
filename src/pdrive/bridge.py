@@ -24,16 +24,17 @@ def find_node(configured: Optional[str] = None) -> str:
 
 
 def bridge_command(node: str, bridge_dir: Path = BRIDGE_DIR, dns: str = "system") -> list[str]:
-    """Prefer the pre-built bundle (``npm run build``; starts ~0.4 s faster). Fall back to running the
-    TypeScript through tsx when the bundle is missing or older than bridge.ts."""
-    if not (bridge_dir / "node_modules" / "@protontech" / "drive-sdk").is_dir():
-        raise PdriveError(f"bridge dependencies missing; run: npm ci --prefix {bridge_dir}")
+    """Prefer the pre-built bundle (made by the installer, or ``npm run build``). It contains the SDK,
+    so it needs no node_modules and starts ~0.4 s faster. Fall back to running bridge.ts through tsx
+    when the bundle is missing, or is older than bridge.ts during development."""
     cmd = [node, "--conditions=browser"]
     if dns == "cloudflare":
         cmd += ["--require", str(bridge_dir / "dns-cloudflare.cjs")]
     src, bundle = bridge_dir / "bridge.ts", bridge_dir / "dist" / "bridge.mjs"
-    if bundle.exists() and bundle.stat().st_mtime >= src.stat().st_mtime:
+    if bundle.exists() and (not src.exists() or bundle.stat().st_mtime >= src.stat().st_mtime):
         return cmd + [str(bundle)]
+    if not (bridge_dir / "node_modules" / "@protontech" / "drive-sdk").is_dir():
+        raise PdriveError(f"bridge not built; run: npm ci --prefix {bridge_dir} && npm run build --prefix {bridge_dir}")
     return cmd + ["--import", "tsx", str(src)]
 
 

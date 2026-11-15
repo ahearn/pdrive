@@ -64,11 +64,11 @@ def test_bridge_exit_fails_pending_and_later_calls(bb):
         bb.children("a")
 
 
-def test_bridge_command_requires_install(tmp_path):
-    with pytest.raises(PdriveError, match="npm ci"):
-        bridge_command("node", bridge_dir=tmp_path)
-    (tmp_path / "node_modules/@protontech/drive-sdk").mkdir(parents=True)
+def test_bridge_command_choice(tmp_path):
     (tmp_path / "bridge.ts").write_text("")
+    with pytest.raises(PdriveError, match="npm ci"):
+        bridge_command("node", bridge_dir=tmp_path)  # no bundle, no node_modules
+    (tmp_path / "node_modules/@protontech/drive-sdk").mkdir(parents=True)
     cmd = bridge_command("/n", bridge_dir=tmp_path, dns="cloudflare")
     assert cmd[:2] == ["/n", "--conditions=browser"] and "--require" in cmd and cmd[-1].endswith("bridge.ts")
     (tmp_path / "dist").mkdir()
@@ -76,3 +76,10 @@ def test_bridge_command_requires_install(tmp_path):
     assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("dist/bridge.mjs")
     os.utime(tmp_path / "dist/bridge.mjs", (0, 0))  # stale bundle -> back to tsx
     assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("bridge.ts")
+
+
+def test_bundle_alone_is_enough(tmp_path):
+    """An installed wheel has the bundle but neither node_modules nor (necessarily) a fresh bridge.ts."""
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist/bridge.mjs").write_text("")
+    assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("dist/bridge.mjs")

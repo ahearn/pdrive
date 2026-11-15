@@ -16,24 +16,21 @@ Proton has no Python SDK, so pdrive is two parts:
 
 Needs Python ≥ 3.10 and Node ≥ 22.
 
-1. Install the bridge's Node dependencies (the Proton SDK, `tsx` and `esbuild`), then bundle it:
+Install it with one of these:
 
-   ```sh
-   npm ci --prefix src/pdrive/bridge_js
-   npm run build --prefix src/pdrive/bridge_js   # optional: every command starts ~0.4 s faster
-   ```
+```sh
+uv tool install -e .                  # password saved to a 0600 file
+uv tool install -e '.[keyring]'       # password saved to the system keyring
+```
 
-   Without the bundle, or when `bridge.ts` is newer than it, pdrive runs the TypeScript through `tsx`.
-   Rebuild after you edit `bridge.ts`.
+With pip, the same choice is `pip install -e .` or `pip install -e '.[keyring]'`.
 
-2. Install the `pdrive` command. Pick **one** of these:
-
-   ```sh
-   uv tool install -e .                  # password saved to a 0600 file
-   uv tool install -e '.[keyring]'       # password saved to the system keyring
-   ```
-
-   With pip, the same choice is `pip install -e .` or `pip install -e '.[keyring]'`.
+The installer also builds the Node bridge (`hatch_build.py` runs `npm ci` and `npm run build` in
+`src/pdrive/bridge_js`), so `npm` must be on PATH at install time. Without npm the install still
+succeeds, and pdrive prints the two commands to run when it first starts. `PDRIVE_SKIP_NPM=1` skips the
+step. The bundle the step produces contains the SDK, so at runtime pdrive needs `node` but not
+`node_modules`. After editing `bridge.ts`, run `npm run build --prefix src/pdrive/bridge_js`. Until you
+do, pdrive runs the TypeScript through `tsx`.
 
 `[keyring]` is an optional extra. It installs the [`keyring`](https://pypi.org/project/keyring/) package,
 and `pdrive login` then saves the share password in your desktop's secret store (GNOME Keyring or

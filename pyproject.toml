@@ -22,6 +22,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pdrive"]
 exclude = ["src/pdrive/bridge_js/node_modules"]
+# The bundle is git-ignored but must ship in the wheel: it contains the SDK, so an installed
+# (non-editable) pdrive needs only node at runtime, not node_modules.
+artifacts = ["src/pdrive/bridge_js/dist/bridge.mjs"]
+
+[tool.hatch.build.hooks.custom]
+# hatch_build.py: runs npm ci + npm run build for the Node bridge (skip with PDRIVE_SKIP_NPM=1)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
