@@ -155,3 +155,126 @@ class BridgeBackend:
             self._proc.terminate()
             self._proc.wait(timeout=5)
         self._reader.join(timeout=2)
+
+
+class BridgePool:
+    """Backend over several bridge processes, each with its own Proton session.
+
+    Listing is CPU-bound: the SDK decrypts every entry's key and name (~18 ms each), and Node does that
+    on one core. Big walks and transfers therefore go to the least-busy of up to ``max_bridges``
+    processes. Extra bridges start lazily, in the background, once calls queue up (``busy`` calls in
+    flight on every bridge), so short commands like ``ls`` run a single process.
+
+    Changes (mkdir, rename, delete) always use the first bridge. Uploads do too while a rate limit is
+    set, because the limit is enforced per process.
+    """
+
+    def __init__(self, spawn: Callable[[], Any], max_bridges: int = 8, busy: int = 2):
+        self._spawn = spawn
+        self.max_bridges = max(1, max_bridges)
+        self.busy = busy
+        self._lock = threading.Lock()
+        self._bridges: list[Any] = []
+        self._load: dict[int, int] = {}
+        self._starting = 0
+        self._creds: Optional[tuple[str, str]] = None
+        self._rate = 0
+        self._closed = False
+        self._growers: list[threading.Thread] = []
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._bridges)
+
+    @property
+    def primary(self):
+        return self._bridges[0]
+
+    def auth(self, url: str, password: str) -> Node:
+        b = self._spawn()
+        try:
+            root = b.auth(url, password)
+        except Exception:
+            b.close()
+            raise
+        with self._lock:
+            self._creds = (url, password)
+            self._bridges = [b]
+            self._load = {id(b): 0}
+        return root
+
+    def _grow(self) -> None:
+        b = None
+        try:
+            b = self._spawn()
+            assert self._creds is not None
+            b.auth(*self._creds)
+        except Exception:  # an extra bridge is an optimisation; carry on with the ones we have
+            if b is not None:
+                b.close()
+            b = None
+        with self._lock:
+            self._starting -= 1
+            if b is not None and not self._closed:
+                self._bridges.append(b)
+                self._load[id(b)] = 0
+                b = None
+        if b is not None:  # pool closed while this bridge was starting
+            b.close()
+
+    def _acquire(self, spread: bool):
+        with self._lock:
+            if self._closed or not self._bridges:
+                raise RemoteError("bridge", "not authenticated")
+            b = min(self._bridges, key=lambda x: self._load[id(x)]) if spread else self._bridges[0]
+            if (spread and self._load[id(b)] >= self.busy
+                    and len(self._bridges) + self._starting < self.max_bridges):
+                self._starting += 1
+                t = threading.Thread(target=self._grow, name="pdrive-bridge-start", daemon=True)
+                self._growers.append(t)
+                t.start()
+            self._load[id(b)] += 1
+            return b
+
+    def _use(self, fn: Callable[[Any], Any], spread: bool = True):
+        b = self._acquire(spread)
+        try:
+            return fn(b)
+        finally:
+            with self._lock:
+                self._load[id(b)] -= 1
+
+    # -- Backend -------------------------------------------------------------
+    def set_rate_limit(self, bytes_per_sec: int) -> None:
+        self._rate = int(bytes_per_sec)
+        self._use(lambda b: b.set_rate_limit(bytes_per_sec), spread=False)
+
+    def children(self, uid: str) -> list[Node]:
+        return self._use(lambda b: b.children(uid))
+
+    def mkdir(self, parent_uid: str, name: str) -> Node:
+        return self._use(lambda b: b.mkdir(parent_uid, name), spread=False)
+
+    def rename(self, uid: str, name: str) -> Node:
+        return self._use(lambda b: b.rename(uid, name), spread=False)
+
+    def delete(self, uids: Iterable[str]) -> list[DeleteResult]:
+        uids = list(uids)
+        return self._use(lambda b: b.delete(uids), spread=False)
+
+    def download(self, uid: str, local_path: str, progress: Optional[ProgressFn] = None) -> int:
+        return self._use(lambda b: b.download(uid, local_path, progress))
+
+    def upload(self, parent_uid: str, name: str, local_path: str, **kw) -> Node:
+        return self._use(lambda b: b.upload(parent_uid, name, local_path, **kw), spread=not self._rate)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            bridges, self._bridges = self._bridges, []
+        closers = [threading.Thread(target=b.close) for b in bridges]
+        for t in closers:
+            t.start()
+        for t in closers + self._growers:
+            t.join(15)

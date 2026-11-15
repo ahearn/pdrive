@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional, TextIO
 
 from . import __version__, remote
-from .bridge import BridgeBackend, bridge_command, find_node
+from .bridge import BridgeBackend, BridgePool, bridge_command, find_node
 from .config import (KEYS, ConfigFile, FileCredentialStore, KeyringCredentialStore, Settings, _usable_keyring,
                      config_dir, parse_size)
-from .drive import Drive, NotFound
+from .drive import LIST_JOBS, Drive, NotFound
 from .output import Reporter, StatusLine, human, long_line
 from .remote import Backend, Node, PdriveError, UsageError
 from .transfer import Policy, plan_get, plan_put, run_get, run_put
@@ -28,7 +28,7 @@ BackendFactory = Callable[[Settings], Backend]
 
 def default_backend_factory(settings: Settings) -> Backend:
     cmd = bridge_command(find_node(settings.get("node")), dns=settings.get("dns"))
-    return BridgeBackend(cmd)
+    return BridgePool(lambda: BridgeBackend(cmd), max_bridges=settings.get("bridges"))
 
 
 class App:
@@ -81,7 +81,9 @@ class App:
         backend = self.backend_factory(self.settings)
         try:
             root = backend.auth(url, password)
-            d = Drive(backend, root)
+            # ~0.7 s per listing is mostly waiting on Proton, so keep 8 in flight per bridge
+            # (measured: 8 bridges x 8 = 64 listed /Music/CDMP3 in 20 s vs 46 s with 1 x 16).
+            d = Drive(backend, root, list_jobs=max(LIST_JOBS, 8 * self.settings.get("bridges")))
             d.on_list = self.status.update
             try:
                 yield d

@@ -112,6 +112,7 @@ Settings live in `~/.config/pdrive/config` (or `$XDG_CONFIG_HOME/pdrive`, or `$P
 |---|---|---|---|
 | `share_url` | `PDRIVE_SHARE_URL` | – | set by `login` |
 | `jobs` | `PDRIVE_JOBS` | 4 | parallel transfers (the SDK runs at most 5 per session) |
+| `bridges` | `PDRIVE_BRIDGES` | 8 | max bridge processes; see [Performance](#performance) |
 | `limit_rate` | `PDRIVE_LIMIT_RATE` | 0 | upload cap, e.g. `20M` (bytes/s) |
 | `dns` | `PDRIVE_DNS` | system | `cloudflare` resolves via 1.1.1.1, for when the router's DNS flakes |
 | `node` | `PDRIVE_NODE` | PATH, then fnm default | node binary |
@@ -135,11 +136,29 @@ saves only the URL, and pdrive then prompts for the password whenever stdin is a
 
 ## Performance
 
-A command spends about 2 s starting the bridge and logging in to the share. Each folder listing is
-then a ~0.5 s round trip. pdrive lists up to 16 folders at a time, so anything that walks a tree
-(`du`, `ls -R`, `get -r`, `rm -n`, skip checks in `put`) fetches the whole tree in parallel, level by
-level. For example, `du -sh TV` (about 1,100 files) takes ~9 s, against 56 s when listing one folder at a time.
-Transfers run `-j` files at a time (default 4). The SDK itself caps one session at 5 concurrent transfers.
+Every command spends about 2 s starting the bridge and logging in to the share. After that there are
+two limits:
+
+- **Latency:** each folder listing is a ~0.7 s round trip to Proton.
+- **CPU:** the SDK decrypts every entry's key and name (~18 ms each), and Node does that on one core.
+
+pdrive works around both:
+
+- It runs up to `bridges` bridge processes (default 8), each with its own session. Extra ones start
+  only when calls begin to queue, so `ls` and other small commands stay at one process.
+- It keeps 8 listings in flight per bridge.
+- It lists trees in the background in depth-first output order. `du` and `ls -R` start printing at once,
+  and a `listing… N folders` line on stderr shows progress.
+
+| measured on the share | before | now |
+|---|---|---|
+| `du -s Music/CDMP3` (879 folders) | 46 s | 20 s |
+| `du -sh TV` | 56 s | ~10 s |
+| `du -sh Music` (~120k entries) | ~35 min (est.) | 2.2 min |
+
+Transfers run `-j` files at a time (default 4) and also spread across bridges. The SDK caps a single
+session at 5 concurrent transfers. Folder creation, rename and delete always use the first bridge,
+and so do uploads while `--limit-rate` is set, because the limit is enforced per process.
 
 ## Development
 

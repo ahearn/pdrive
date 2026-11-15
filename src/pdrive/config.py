@@ -65,6 +65,8 @@ class Key:
 KEYS: dict[str, Key] = {k.name: k for k in [
     Key("share_url", "PDRIVE_SHARE_URL", None, str, "public share link, including the #fragment"),
     Key("jobs", "PDRIVE_JOBS", 4, _positive_int, "parallel transfers (the SDK runs at most 5 per session)"),
+    Key("bridges", "PDRIVE_BRIDGES", 8, _positive_int,
+        "max bridge processes (each decrypts on its own core); extra ones start only when busy"),
     Key("limit_rate", "PDRIVE_LIMIT_RATE", 0, parse_size, "upload rate cap in bytes/s, e.g. 20M (0 = unlimited)"),
     Key("dns", "PDRIVE_DNS", "system", _choice("system", "cloudflare"), "resolver for the bridge: system | cloudflare"),
     Key("node", "PDRIVE_NODE", None, str, "path to the node binary (default: PATH, then fnm's default)"),
