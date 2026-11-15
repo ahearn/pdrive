@@ -47,6 +47,23 @@ def _positive_int(text: str) -> int:
     return v
 
 
+def _positive_float(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        raise UsageError(f"invalid number: {text!r}") from None
+    if v <= 0:
+        raise UsageError(f"must be more than 0: {text!r}")
+    return v
+
+
+def _port(text: str) -> int:
+    v = _positive_int(text)
+    if v > 65535:
+        raise UsageError(f"invalid port: {text!r}")
+    return v
+
+
 def _choice(*options: str) -> Callable[[str], str]:
     def check(text: str) -> str:
         if text not in options:
@@ -69,6 +86,11 @@ KEYS: dict[str, Key] = {k.name: k for k in [
     Key("jobs", "PDRIVE_JOBS", 4, _positive_int, "parallel transfers (the SDK runs at most 5 per session)"),
     Key("bridges", "PDRIVE_BRIDGES", 8, _positive_int,
         "max bridge processes (each decrypts on its own core); extra ones start only when busy"),
+    Key("cache_ttl", "PDRIVE_CACHE_TTL", 30.0, _positive_float,
+        "minutes the listing cache stays warm after the last use"),
+    Key("mcp_port", "PDRIVE_MCP_PORT", 14912, _port, "port for the MCP server (pdrive --mcp)"),
+    Key("refresh_interval", "PDRIVE_REFRESH_INTERVAL", 60.0, _positive_float,
+        "seconds between background re-lists while the MCP server's cache is warm"),
     Key("limit_rate", "PDRIVE_LIMIT_RATE", 0, parse_size, "upload rate cap in bytes/s, e.g. 20M (0 = unlimited)"),
     Key("dns", "PDRIVE_DNS", "system", _choice("system", "cloudflare"), "resolver for the bridge: system | cloudflare"),
     Key("node", "PDRIVE_NODE", None, str, "path to the node binary (default: PATH, then fnm's default)"),

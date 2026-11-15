@@ -12,15 +12,18 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Optional, TextIO
+from typing import Callable, Iterable, Iterator, Optional, TextIO
 
 from . import __version__, remote
 from .bridge import BridgeBackend, BridgePool, bridge_command, find_node
+from .cache import CacheStore
+from .cache import default_cache_path as cache_path
 from .config import (KEYS, ConfigFile, FileCredentialStore, KeyringCredentialStore, Settings, _usable_keyring,
                      config_dir, parse_size)
 from .drive import LIST_JOBS, Drive, NotFound
 from .output import Reporter, StatusLine, human, long_line
 from .remote import Backend, Node, PdriveError, UsageError
+from .session import LazyBackend
 from .transfer import Policy, plan_get, plan_put, run_get, run_put
 
 BackendFactory = Callable[[Settings], Backend]
@@ -44,7 +47,8 @@ class App:
         self.backend_factory = backend_factory
         self.prompt_password = prompt_password
         self.cfg = ConfigFile(Path(args.config_dir) if args.config_dir else config_dir(env))
-        self.settings = Settings(self.cfg, env, {"share_url": args.share_url})
+        self.settings = Settings(self.cfg, env, {"share_url": args.share_url, "cache_ttl": args.cache_ttl,
+                                                 "mcp_port": getattr(args, "port", None)})
         self.keyring_loader = keyring_loader
         quiet = getattr(args, "quiet", False)
         self.status = StatusLine(stderr, enabled=stderr.isatty() and not quiet)
@@ -69,20 +73,38 @@ class App:
             raise PdriveError("no share configured; run: pdrive login <share-url>")
         return url
 
-    @contextmanager
-    def drive(self) -> Iterator[Drive]:
-        url = self.share_url()
+    def password(self, url: str) -> str:
         password = self.settings.password(url, **self._kr())
         if password is None:
             if not self.stdin.isatty():
                 raise PdriveError("no saved password; run: pdrive login (or set PDRIVE_PASSWORD)")
             password = self.prompt_password("Share password: ")
-        backend = self.backend_factory(self.settings)
+        return password
+
+    def open_store(self) -> Optional[CacheStore]:
+        if self.args.no_cache:
+            return None
+        return CacheStore(cache_path(self.env), self.share_url(), ttl_s=60 * self.settings.get("cache_ttl"))
+
+    @contextmanager
+    def drive(self, paths: Iterable[str] = ()) -> Iterator[Drive]:
+        """A Drive for one command. With a warm cache, nothing connects to Proton until a listing
+        or transfer actually needs it. ``paths`` are recorded as recent activity, which steers the
+        MCP server's background refresh."""
+        url = self.share_url()
+        store = self.open_store()
+        backend = LazyBackend(lambda: self.backend_factory(self.settings), url, lambda: self.password(url))
         try:
-            root = backend.auth(url, password)
-            # ~0.7 s per listing is mostly waiting on Proton, so keep 8 in flight per bridge
-            # (measured: 8 bridges x 8 = 64 listed /Music/CDMP3 in 20 s vs 46 s with 1 x 16).
-            d = Drive(backend, root, list_jobs=max(LIST_JOBS, 8 * self.settings.get("bridges")))
+            if store:
+                store.begin_use()
+                for p in paths:
+                    store.touch(remote.normpath(p))
+            root = store.get_root() if store else None
+            if root is None:
+                root = backend.connect()
+                if store:
+                    store.set_root(root)
+            d = Drive(backend, root, list_jobs=list_jobs(self.settings), store=store)
             d.on_list = self.status.update
             try:
                 yield d
@@ -91,9 +113,38 @@ class App:
         finally:
             self.status.clear()
             backend.close()
+            if store:
+                store.close()
+
+
+def list_jobs(settings: Settings) -> int:
+    # ~0.7 s per listing is mostly waiting on Proton, so keep 8 in flight per bridge
+    # (measured: 8 bridges x 8 = 64 listed /Music/CDMP3 in 20 s vs 46 s with 1 x 16).
+    return max(LIST_JOBS, 8 * settings.get("bridges"))
 
 
 # ------------------------------------------------------------------------------------- commands
+def cmd_mcp(app: App) -> int:
+    from .mcp_server import ServerState, serve  # imports the MCP SDK only when serving
+    url = app.share_url()
+    ttl_min = app.settings.get("cache_ttl")
+    password = app.password(url)
+    store = CacheStore(cache_path(app.env), url, ttl_s=60 * ttl_min)
+    backend = LazyBackend(lambda: app.backend_factory(app.settings), url, lambda: password)
+    state = ServerState(store, backend, list_jobs(app.settings), app.settings.get("refresh_interval"))
+    return serve(state, app.settings.get("mcp_port"), ttl_min, out=app.stderr)
+
+
+def cmd_flush_cache(app: App) -> int:
+    store = CacheStore(cache_path(app.env), app.share_url(), ttl_s=60 * app.settings.get("cache_ttl"))
+    try:
+        n = store.flush()
+    finally:
+        store.close()
+    app.info(f"flushed {n} cached folder listing(s)")
+    return 0
+
+
 def cmd_login(app: App) -> int:
     a = app.args
     url = a.url or app.settings.get("share_url")
@@ -181,7 +232,7 @@ def cmd_ls(app: App) -> int:
     a = app.args
     paths = a.paths or ["/"]
     status = 0
-    with app.drive() as d:
+    with app.drive(paths) as d:
         listings: list[tuple[str, Node]] = []
         for p in paths:
             try:
@@ -240,7 +291,7 @@ def cmd_du(app: App) -> int:
     fmt = human if a.human_readable else str
     if a.max_depth is not None and a.max_depth < 0:
         raise UsageError("du: --max-depth must be 0 or more")
-    with app.drive() as d:
+    with app.drive(a.paths) as d:
         for p in a.paths or ["/"]:
             p = remote.normpath(p)
             try:
@@ -271,7 +322,7 @@ def _du(d: Drive, node: Node, path: str, depth: int, max_depth: Optional[int], e
 
 def cmd_stat(app: App) -> int:
     status = 0
-    with app.drive() as d:
+    with app.drive(app.args.paths) as d:
         for p in app.args.paths:
             try:
                 n = d.stat(p)
@@ -293,7 +344,7 @@ def cmd_stat(app: App) -> int:
 
 def cmd_mkdir(app: App) -> int:
     status = 0
-    with app.drive() as d:
+    with app.drive(app.args.paths) as d:
         for p in app.args.paths:
             try:
                 d.mkdir(p, parents=app.args.parents)
@@ -306,7 +357,7 @@ def cmd_mkdir(app: App) -> int:
 
 
 def cmd_rename(app: App) -> int:
-    with app.drive() as d:
+    with app.drive([app.args.path]) as d:
         d.rename(app.args.path, app.args.new_name)
     return 0
 
@@ -314,7 +365,7 @@ def cmd_rename(app: App) -> int:
 def cmd_rm(app: App) -> int:
     a = app.args
     status = 0
-    with app.drive() as d:
+    with app.drive(a.paths) as d:
         targets: list[tuple[str, Node]] = []
         for p in a.paths:
             path = remote.normpath(p)
@@ -364,7 +415,7 @@ def cmd_put(app: App) -> int:
     a = app.args
     jobs = a.jobs or app.settings.get("jobs")
     rate = parse_size(a.limit_rate) if a.limit_rate is not None else app.settings.get("limit_rate")
-    with app.drive() as d:
+    with app.drive([a.dest]) as d:
         if rate and not a.dry_run:
             d.backend.set_rate_limit(rate)
         plan = plan_put(d, a.sources, a.dest, recursive=a.recursive, exclude=a.exclude)
@@ -383,7 +434,7 @@ def cmd_put(app: App) -> int:
 def cmd_get(app: App) -> int:
     a = app.args
     jobs = a.jobs or app.settings.get("jobs")
-    with app.drive() as d:
+    with app.drive(a.sources) as d:
         plan = plan_get(d, a.sources, a.dest, recursive=a.recursive, exclude=a.exclude)
         app.status.clear()
         d.on_list = None
@@ -404,6 +455,20 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, f"pdrive: {message}\n")
 
 
+def _ttl(text: str) -> float:
+    try:
+        return KEYS["cache_ttl"].parse(text)
+    except UsageError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _port_arg(text: str) -> int:
+    try:
+        return KEYS["mcp_port"].parse(text)
+    except UsageError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     def flags(default):  # -v/-q work before or after the command; SUPPRESS keeps the global value
         c = argparse.ArgumentParser(add_help=False)
@@ -419,12 +484,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"pdrive {__version__}")
     p.add_argument("--share-url", metavar="URL", help="share link to use (default: saved by login; env PDRIVE_SHARE_URL)")
     p.add_argument("--config-dir", metavar="DIR", help="config directory (default: ~/.config/pdrive; env PDRIVE_CONFIG_DIR)")
+    p.add_argument("--cache-ttl", metavar="MIN", type=_ttl,
+                   help="minutes cached listings stay warm after the last use (default: config 'cache_ttl', 30)")
+    p.add_argument("--no-cache", action="store_true", help="don't read or write the listing cache")
+    p.add_argument("-mcp", "--mcp", action="store_true",
+                   help="run the MCP server (HTTP on 127.0.0.1) instead of a command")
+    p.add_argument("--port", type=_port_arg, metavar="PORT", help="MCP server port (default: config 'mcp_port', 14912)")
     sub = p.add_subparsers(dest="command", metavar="COMMAND", parser_class=_Parser)
 
     def add(name: str, func, help: str, **kw) -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help, description=help, parents=[sub_common], **kw)
         sp.set_defaults(func=func)
         return sp
+
+    add("flush-cache", cmd_flush_cache, "forget all cached folder listings for the share")
 
     sp = add("login", cmd_login, "verify a share link and password and save them")
     sp.add_argument("url", nargs="?", help="share link, e.g. https://drive.proton.me/urls/XXXX#key")
@@ -498,6 +571,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None, **app_kw) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.mcp:
+        if getattr(args, "func", None):
+            parser.error("--mcp runs the server; don't give a command as well")
+        args.func = cmd_mcp
     if not getattr(args, "func", None):
         parser.print_help(sys.stderr)
         return 2

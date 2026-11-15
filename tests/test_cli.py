@@ -20,7 +20,8 @@ class Run:
     def __init__(self, backend, tmp_path):
         self.backend = backend
         self.cfg_dir = tmp_path / "cfg"
-        self.env = {"PDRIVE_CONFIG_DIR": str(self.cfg_dir)}
+        self.cache_dir = tmp_path / "cache"
+        self.env = {"PDRIVE_CONFIG_DIR": str(self.cfg_dir), "PDRIVE_CACHE_DIR": str(self.cache_dir)}
 
     def __call__(self, *argv, stdin="", tty=False, prompt=lambda q: PASSWORD, env=None):
         self.out, self.err = io.StringIO(), io.StringIO()
