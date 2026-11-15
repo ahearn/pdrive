@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 from pathlib import Path
@@ -67,5 +68,11 @@ def test_bridge_command_requires_install(tmp_path):
     with pytest.raises(PdriveError, match="npm ci"):
         bridge_command("node", bridge_dir=tmp_path)
     (tmp_path / "node_modules/@protontech/drive-sdk").mkdir(parents=True)
+    (tmp_path / "bridge.ts").write_text("")
     cmd = bridge_command("/n", bridge_dir=tmp_path, dns="cloudflare")
     assert cmd[:2] == ["/n", "--conditions=browser"] and "--require" in cmd and cmd[-1].endswith("bridge.ts")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist/bridge.mjs").write_text("")
+    assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("dist/bridge.mjs")
+    os.utime(tmp_path / "dist/bridge.mjs", (0, 0))  # stale bundle -> back to tsx
+    assert bridge_command("/n", bridge_dir=tmp_path)[-1].endswith("bridge.ts")

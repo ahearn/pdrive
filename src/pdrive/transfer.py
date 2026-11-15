@@ -149,6 +149,8 @@ def run_put(drive: Drive, plan: PutPlan, reporter: Reporter, *, policy: Policy =
     """Execute a put plan. Returns the number of failures (including planning errors and conflicts)."""
     for err in plan.errors:
         reporter.fail(None, err)
+    # Skip checks need a listing of every destination folder; fetch them in parallel up front.
+    drive.lookup_many(plan.folders + [u.remote_path for u in plan.uploads])
     if dry_run:
         for f in plan.folders:
             if drive.lookup(f) is None:

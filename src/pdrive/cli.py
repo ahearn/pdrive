@@ -178,6 +178,7 @@ def cmd_ls(app: App) -> int:
                     for sub_path, sub in d.walk(n, p):
                         _ls_entry(app, d, sub_path, sub, sub_path)
                 else:
+                    d.prefetch([n])
                     _ls_tree(app, d, p, n, first=(i == 0 and not files))
             else:
                 if len(listings) > 1 and not a.json:
@@ -228,6 +229,7 @@ def cmd_du(app: App) -> int:
             if not node.is_dir or a.summarize:
                 app.stdout.write(f"{fmt(d.tree_size(node))}\t{p}\n")
                 continue
+            d.prefetch([node])
             _du(d, node, p, 0, a.max_depth, lambda s, q: app.stdout.write(f"{fmt(s)}\t{q}\n"))
     return status
 

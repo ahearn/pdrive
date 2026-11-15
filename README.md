@@ -16,11 +16,15 @@ Proton has no Python SDK, so pdrive is two parts:
 
 Needs Python ≥ 3.10 and Node ≥ 22.
 
-1. Install the bridge's Node dependencies (the Proton SDK and `tsx`):
+1. Install the bridge's Node dependencies (the Proton SDK, `tsx` and `esbuild`), then bundle it:
 
    ```sh
    npm ci --prefix src/pdrive/bridge_js
+   npm run build --prefix src/pdrive/bridge_js   # optional: every command starts ~0.4 s faster
    ```
+
+   Without the bundle, or when `bridge.ts` is newer than it, pdrive runs the TypeScript through `tsx`.
+   Rebuild after you edit `bridge.ts`.
 
 2. Install the `pdrive` command. Pick **one** of these:
 
@@ -131,6 +135,14 @@ saves only the URL, and pdrive then prompts for the password whenever stdin is a
   silently.
 - No move between folders, because the link API has no move.
 - Sizes are the size the uploader claimed. Folders have no size of their own, so `du` sums the files.
+
+## Performance
+
+A command spends about 2 s starting the bridge and logging in to the share. Each folder listing is
+then a ~0.5 s round trip. pdrive lists up to 16 folders at a time, so anything that walks a tree
+(`du`, `ls -R`, `get -r`, `rm -n`, skip checks in `put`) fetches the whole tree in parallel, level by
+level. For example, `du -sh TV` (about 1,100 files) takes ~9 s, against 56 s when listing one folder at a time.
+Transfers run `-j` files at a time (default 4). The SDK itself caps one session at 5 concurrent transfers.
 
 ## Development
 

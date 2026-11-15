@@ -83,3 +83,66 @@ def test_walk_and_size(drive):
     assert paths == ["/Movies/A", "/Movies/A/Alien (1979).mkv", "/Movies/B", "/Movies/B/Blade Runner.mkv"]
     assert drive.tree_size(drive.stat("/Movies")) == 350
     assert drive.tree_size(drive.root) == 365
+
+
+def test_prefetch_lists_folders_concurrently(backend):
+    import threading
+    import time
+    for i in range(6):
+        backend.add(f"Wide/d{i}/f.txt", b"x")
+    active, peak, lock = [0], [0], threading.Lock()
+    real = backend.children
+
+    def slow_children(uid):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return real(uid)
+
+    backend.children = slow_children
+    d = Drive(backend, backend.auth("u", "s3cret"), list_jobs=8)
+    files = [p for p, n in d.walk(d.stat("/Wide"), "/Wide") if not n.is_dir]
+    assert len(files) == 6
+    assert peak[0] >= 4  # the six d* folders were listed side by side
+
+
+def test_lookup_many_warms_cache(drive, backend):
+    drive.lookup_many(["/Movies/A/x.mkv", "/Music/y.mp3"])
+    before = len(backend.calls)
+    assert drive.lookup("/Movies/A/Alien (1979).mkv") is not None
+    assert len(backend.calls) == before
+
+
+def test_listdir_refetches_when_folder_changes_mid_listing(backend):
+    from pdrive.drive import Drive
+
+    root = backend.auth("u", "s3cret")
+    drive = Drive(backend, root)
+
+    movies_node = backend.find("Movies").node()
+
+    original_children = backend.children
+    target_uid = movies_node.uid
+    call_count = [0]
+
+    def patched_children(uid):
+        result = original_children(uid)
+        if uid == target_uid:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Simulate another worker finishing an upload while listing is in-flight:
+                new_entry = backend.add("Movies/race_file.txt", b"late")
+                drive.record_upload(movies_node, new_entry.node())
+        return result
+
+    backend.children = patched_children
+
+    result = drive.listdir(movies_node)
+
+    names = [n.name for n in result]
+    assert "race_file.txt" in names
+    children_calls_for_folder = [c for c in backend.calls if c[0] == "children" and c[1] == target_uid]
+    assert len(children_calls_for_folder) == 2

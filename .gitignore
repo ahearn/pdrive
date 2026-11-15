@@ -6,3 +6,4 @@ dist/
 build/
 *.egg-info/
 node_modules/
+src/pdrive/bridge_js/dist/

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import threading
-from typing import Iterator, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable, Iterator, Optional
 
 from . import remote
 from .remote import Backend, Node, PdriveError
@@ -20,22 +21,63 @@ class NotADirectory(PdriveError):
         self.path = path
 
 
+LIST_JOBS = 16  # concurrent folder listings (~0.5 s round trip each); 16 measured best, 24 no faster
+
+
 class Drive:
-    def __init__(self, backend: Backend, root: Node):
+    def __init__(self, backend: Backend, root: Node, list_jobs: int = LIST_JOBS):
         self.backend = backend
         self.root = root
+        self.list_jobs = list_jobs
         self._children: dict[str, list[Node]] = {}
-        self._lock = threading.RLock()  # transfers create folders from worker threads
+        self._changes: dict[str, int] = {}  # per-folder mutation count, to detect changes mid-listing
+        # Guards the cache and folder creation. Never held across a listing call, so parallel workers
+        # can list different folders at the same time.
+        self._lock = threading.RLock()
 
     # -- listing --------------------------------------------------------------
     def listdir(self, node: Node) -> list[Node]:
         if not node.is_dir:
             raise NotADirectory(node.name)
         with self._lock:
-            if node.uid not in self._children:
-                kids = self.backend.children(node.uid)
-                self._children[node.uid] = sorted(kids, key=lambda n: n.name)
-            return list(self._children[node.uid])
+            cached = self._children.get(node.uid)
+        while cached is None:
+            with self._lock:
+                seen = self._changes.get(node.uid, 0)
+            kids = sorted(self.backend.children(node.uid), key=lambda n: n.name)
+            with self._lock:
+                if node.uid in self._children:
+                    cached = self._children[node.uid]
+                elif self._changes.get(node.uid, 0) == seen:  # else: changed while listing; list again
+                    cached = self._children[node.uid] = kids
+        return list(cached)
+
+    def prefetch(self, folders: Iterable[Node], recursive: bool = True) -> None:
+        """List folders concurrently (breadth first when ``recursive``) so later walks hit the cache."""
+        level = [f for f in folders if f.is_dir]
+        with ThreadPoolExecutor(max_workers=self.list_jobs) as ex:
+            while level:
+                listings = list(ex.map(self.listdir, level))  # cached folders return immediately
+                if not recursive:
+                    return
+                level = [k for kids in listings for k in kids if k.is_dir]
+
+    def lookup_many(self, paths: Iterable[str]) -> None:
+        """Warm the cache for many paths at once, listing each depth level in parallel."""
+        by_depth: dict[int, set[str]] = {}
+        for p in paths:
+            ps = remote.parts(p)
+            for i in range(len(ps)):
+                by_depth.setdefault(i, set()).add("/" + "/".join(ps[:i]))
+        for depth in sorted(by_depth):
+            nodes = [n for n in (self._try_lookup(p) for p in by_depth[depth]) if n is not None and n.is_dir]
+            self.prefetch(nodes, recursive=False)
+
+    def _try_lookup(self, path: str) -> Optional[Node]:
+        try:
+            return self.lookup(path)
+        except NotADirectory:
+            return None
 
     def child(self, folder: Node, name: str) -> Optional[Node]:
         for n in self.listdir(folder):
@@ -62,12 +104,17 @@ class Drive:
         return node
 
     def walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
-        """Yield (path, node) for every descendant of a folder, depth first, parents before children."""
+        """Yield (path, node) for every descendant of a folder, depth first, parents before children.
+        The whole tree is listed up front, in parallel."""
+        self.prefetch([node])
+        yield from self._walk(node, path)
+
+    def _walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
         for kid in self.listdir(node):
             kid_path = remote.join(path, kid.name)
             yield kid_path, kid
             if kid.is_dir:
-                yield from self.walk(kid, kid_path)
+                yield from self._walk(kid, kid_path)
 
     def tree_size(self, node: Node) -> int:
         if not node.is_dir:
@@ -77,12 +124,14 @@ class Drive:
     # -- mutation (keeps the cache coherent) -----------------------------------
     def _add(self, parent: Node, node: Node) -> None:
         with self._lock:
+            self._changes[parent.uid] = self._changes.get(parent.uid, 0) + 1
             if parent.uid in self._children:
                 kids = [n for n in self._children[parent.uid] if n.name != node.name] + [node]
                 self._children[parent.uid] = sorted(kids, key=lambda n: n.name)
 
     def _remove(self, parent_uid: str, uid: str) -> None:
         with self._lock:
+            self._changes[parent_uid] = self._changes.get(parent_uid, 0) + 1
             if parent_uid in self._children:
                 self._children[parent_uid] = [n for n in self._children[parent_uid] if n.uid != uid]
             self._children.pop(uid, None)

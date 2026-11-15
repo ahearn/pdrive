@@ -24,12 +24,17 @@ def find_node(configured: Optional[str] = None) -> str:
 
 
 def bridge_command(node: str, bridge_dir: Path = BRIDGE_DIR, dns: str = "system") -> list[str]:
+    """Prefer the pre-built bundle (``npm run build``; starts ~0.4 s faster). Fall back to running the
+    TypeScript through tsx when the bundle is missing or older than bridge.ts."""
     if not (bridge_dir / "node_modules" / "@protontech" / "drive-sdk").is_dir():
         raise PdriveError(f"bridge dependencies missing; run: npm ci --prefix {bridge_dir}")
     cmd = [node, "--conditions=browser"]
     if dns == "cloudflare":
         cmd += ["--require", str(bridge_dir / "dns-cloudflare.cjs")]
-    return cmd + ["--import", "tsx", str(bridge_dir / "bridge.ts")]
+    src, bundle = bridge_dir / "bridge.ts", bridge_dir / "dist" / "bridge.mjs"
+    if bundle.exists() and bundle.stat().st_mtime >= src.stat().st_mtime:
+        return cmd + [str(bundle)]
+    return cmd + ["--import", "tsx", str(src)]
 
 
 class _Call:
