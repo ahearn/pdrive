@@ -19,7 +19,7 @@ from .bridge import BridgeBackend, bridge_command, find_node
 from .config import (KEYS, ConfigFile, FileCredentialStore, KeyringCredentialStore, Settings, _usable_keyring,
                      config_dir, parse_size)
 from .drive import Drive, NotFound
-from .output import Reporter, human, long_line
+from .output import Reporter, StatusLine, human, long_line
 from .remote import Backend, Node, PdriveError, UsageError
 from .transfer import Policy, plan_get, plan_put, run_get, run_put
 
@@ -46,6 +46,13 @@ class App:
         self.cfg = ConfigFile(Path(args.config_dir) if args.config_dir else config_dir(env))
         self.settings = Settings(self.cfg, env, {"share_url": args.share_url})
         self.keyring_loader = keyring_loader
+        quiet = getattr(args, "quiet", False)
+        self.status = StatusLine(stderr, enabled=stderr.isatty() and not quiet)
+
+    def out(self, text: str) -> None:
+        """Write to stdout, first clearing any transient status line on the terminal."""
+        self.status.clear()
+        self.stdout.write(text)
 
     def _kr(self) -> dict:
         return {"keyring_loader": self.keyring_loader} if self.keyring_loader is not None else {}
@@ -74,8 +81,14 @@ class App:
         backend = self.backend_factory(self.settings)
         try:
             root = backend.auth(url, password)
-            yield Drive(backend, root)
+            d = Drive(backend, root)
+            d.on_list = self.status.update
+            try:
+                yield d
+            finally:
+                d.stop()
         finally:
+            self.status.clear()
             backend.close()
 
 
@@ -178,18 +191,18 @@ def cmd_ls(app: App) -> int:
                     for sub_path, sub in d.walk(n, p):
                         _ls_entry(app, d, sub_path, sub, sub_path)
                 else:
-                    d.prefetch([n])
+                    d.start_prefetch(n)
                     _ls_tree(app, d, p, n, first=(i == 0 and not files))
             else:
                 if len(listings) > 1 and not a.json:
-                    app.stdout.write(("\n" if (i or files) else "") + f"{p}:\n")
+                    app.out(("\n" if (i or files) else "") + f"{p}:\n")
                 for kid in d.listdir(n):
                     _ls_entry(app, d, remote.join(p, kid.name), kid, kid.name)
     return status
 
 
 def _ls_tree(app: App, d: Drive, path: str, node: Node, first: bool) -> None:
-    app.stdout.write(("" if first else "\n") + f"{path}:\n")
+    app.out(("" if first else "\n") + f"{path}:\n")
     kids = d.listdir(node)
     for kid in kids:
         _ls_entry(app, d, remote.join(path, kid.name), kid, kid.name)
@@ -203,14 +216,14 @@ def _ls_entry(app: App, d: Drive, path: str, node: Node, label: str) -> None:
     if a.json:
         rec = {"path": path, "name": node.name, "type": node.type, "size": node.size, "mtime": node.mtime,
                "media_type": node.media_type, "uid": node.uid}
-        app.stdout.write(json.dumps(rec) + "\n")
+        app.out(json.dumps(rec) + "\n")
         return
     if a.classify and node.is_dir:
         label += "/"
     if a.long:
-        app.stdout.write(long_line(node, label, a.human_readable) + "\n")
+        app.out(long_line(node, label, a.human_readable) + "\n")
     else:
-        app.stdout.write(label + "\n")
+        app.out(label + "\n")
 
 
 def cmd_du(app: App) -> int:
@@ -227,10 +240,10 @@ def cmd_du(app: App) -> int:
                 status = 1
                 continue
             if not node.is_dir or a.summarize:
-                app.stdout.write(f"{fmt(d.tree_size(node))}\t{p}\n")
+                app.out(f"{fmt(d.tree_size(node))}\t{p}\n")
                 continue
-            d.prefetch([node])
-            _du(d, node, p, 0, a.max_depth, lambda s, q: app.stdout.write(f"{fmt(s)}\t{q}\n"))
+            d.start_prefetch(node)
+            _du(d, node, p, 0, a.max_depth, lambda s, q: app.out(f"{fmt(s)}\t{q}\n"))
     return status
 
 
@@ -259,12 +272,12 @@ def cmd_stat(app: App) -> int:
             rec = {"path": remote.normpath(p), "name": n.name, "type": n.type, "size": n.size,
                    "mtime": n.mtime, "media_type": n.media_type, "uid": n.uid}
             if app.args.json:
-                app.stdout.write(json.dumps(rec) + "\n")
+                app.out(json.dumps(rec) + "\n")
             else:
                 for k, v in rec.items():
-                    app.stdout.write(f"{k + ':':<12}{'' if v is None else v}\n")
+                    app.out(f"{k + ':':<12}{'' if v is None else v}\n")
                 if len(app.args.paths) > 1:
-                    app.stdout.write("\n")
+                    app.out("\n")
     return status
 
 
@@ -316,7 +329,7 @@ def cmd_rm(app: App) -> int:
         if a.dry_run:
             for path, node in targets:
                 extra = f" ({human(d.tree_size(node))}B)" if node.is_dir else ""
-                app.stdout.write(f"would remove {path}{'/' if node.is_dir else ''}{extra}\n")
+                app.out(f"would remove {path}{'/' if node.is_dir else ''}{extra}\n")
             return status
         for path, err in d.delete(targets):
             if err:
@@ -345,6 +358,8 @@ def cmd_put(app: App) -> int:
         if rate and not a.dry_run:
             d.backend.set_rate_limit(rate)
         plan = plan_put(d, a.sources, a.dest, recursive=a.recursive, exclude=a.exclude)
+        app.status.clear()
+        d.on_list = None  # the transfer meter takes over the status line
         rep = Reporter("uploaded" if not a.dry_run else "would upload", len(plan.uploads),
                        sum(u.size for u in plan.uploads), verbose=a.verbose or a.dry_run, quiet=a.quiet,
                        stream=app.stderr)
@@ -360,6 +375,8 @@ def cmd_get(app: App) -> int:
     jobs = a.jobs or app.settings.get("jobs")
     with app.drive() as d:
         plan = plan_get(d, a.sources, a.dest, recursive=a.recursive, exclude=a.exclude)
+        app.status.clear()
+        d.on_list = None
         rep = Reporter("downloaded" if not a.dry_run else "would download", len(plan.downloads),
                        sum(x.node.size or 0 for x in plan.downloads), verbose=a.verbose or a.dry_run,
                        quiet=a.quiet, stream=app.stderr)

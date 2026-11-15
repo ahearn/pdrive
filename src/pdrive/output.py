@@ -41,6 +41,38 @@ def long_line(node: Node, name: str, human_sizes: bool, size: Optional[int] = No
     return f"{kind} {size_txt:>{6 if human_sizes else 14}} {fmt_mtime(node.mtime)} {name}"
 
 
+class StatusLine:
+    """A transient "listing… N folders" line on stderr for long tree walks (only when it's a terminal).
+    Callers clear it before printing anything else."""
+
+    def __init__(self, stream: TextIO, enabled: bool, clock=time.monotonic):
+        self.stream = stream
+        self.enabled = enabled
+        self.clock = clock
+        self._last: Optional[float] = None
+        self._shown = False
+        self._lock = threading.Lock()
+
+    def update(self, folders: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            now = self.clock()
+            if self._last is not None and now - self._last < 0.2:
+                return
+            self._last = now
+            self.stream.write(f"\r\033[Klisting… {folders} folders")
+            self.stream.flush()
+            self._shown = True
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._shown:
+                self.stream.write("\r\033[K")
+                self.stream.flush()
+                self._shown = False
+
+
 class Reporter:
     """Counts transfers and draws a one-line progress meter when stderr is a terminal."""
 

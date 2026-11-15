@@ -1,9 +1,11 @@
 """Drive: path-based view of a share on top of a uid-based Backend, with a per-run listing cache."""
 from __future__ import annotations
 
+import heapq
+import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 from . import remote
 from .remote import Backend, Node, PdriveError
@@ -24,43 +26,121 @@ class NotADirectory(PdriveError):
 LIST_JOBS = 16  # concurrent folder listings (~0.5 s round trip each); 16 measured best, 24 no faster
 
 
+class _Prefetcher:
+    """Lists a folder tree in the background with ``jobs`` workers.
+
+    Workers always take the pending folder that comes first in depth-first output order, so the
+    subtrees a depth-first consumer (du, ls -R, a recursive get) needs first are finished first. The
+    consumer can print as it goes instead of waiting for the whole tree."""
+
+    def __init__(self, drive: "Drive", root: Node, jobs: int):
+        self.drive = drive
+        self.heap: list[tuple[tuple[int, ...], int, Node]] = [((), 0, root)]
+        self.seq = itertools.count(1)
+        self.cv = threading.Condition()
+        self.active = 0
+        self.stopped = False
+        self.threads = [threading.Thread(target=self._work, name="pdrive-prefetch", daemon=True)
+                        for _ in range(jobs)]
+        for t in self.threads:
+            t.start()
+
+    def stop(self) -> None:
+        with self.cv:
+            self.stopped = True
+            self.cv.notify_all()
+
+    def _work(self) -> None:
+        while True:
+            with self.cv:
+                while not self.heap and self.active and not self.stopped:
+                    self.cv.wait()
+                if self.stopped or not self.heap:  # stopped, or the whole tree is listed
+                    self.cv.notify_all()
+                    return
+                key, _, node = heapq.heappop(self.heap)
+                self.active += 1
+            try:
+                kids = self.drive.listdir(node)
+            except Exception:  # the consumer lists this folder itself and reports the error
+                kids = []
+            with self.cv:
+                for i, kid in enumerate(kids):
+                    if kid.is_dir:
+                        heapq.heappush(self.heap, (key + (i,), next(self.seq), kid))
+                self.active -= 1
+                self.cv.notify_all()
+
+
 class Drive:
     def __init__(self, backend: Backend, root: Node, list_jobs: int = LIST_JOBS):
         self.backend = backend
         self.root = root
         self.list_jobs = list_jobs
+        self.on_list: Optional[Callable[[int], None]] = None  # called with the running count of listings
+        self.listed = 0
         self._children: dict[str, list[Node]] = {}
         self._changes: dict[str, int] = {}  # per-folder mutation count, to detect changes mid-listing
-        # Guards the cache and folder creation. Never held across a listing call, so parallel workers
-        # can list different folders at the same time.
+        self._inflight: dict[str, threading.Event] = {}
+        self._prefetchers: list[_Prefetcher] = []
+        # Guards the cache. Never held across a network call, so parallel workers can list different
+        # folders at the same time.
         self._lock = threading.RLock()
+        self._mkdir_lock = threading.RLock()  # serialises folder creation (check-then-create)
 
     # -- listing --------------------------------------------------------------
     def listdir(self, node: Node) -> list[Node]:
+        """Children of a folder, sorted by name. Each folder is listed at most once at a time; callers
+        that ask for a folder already being listed wait for that listing."""
         if not node.is_dir:
             raise NotADirectory(node.name)
-        with self._lock:
-            cached = self._children.get(node.uid)
-        while cached is None:
+        while True:
             with self._lock:
-                seen = self._changes.get(node.uid, 0)
-            kids = sorted(self.backend.children(node.uid), key=lambda n: n.name)
-            with self._lock:
-                if node.uid in self._children:
-                    cached = self._children[node.uid]
-                elif self._changes.get(node.uid, 0) == seen:  # else: changed while listing; list again
-                    cached = self._children[node.uid] = kids
-        return list(cached)
+                cached = self._children.get(node.uid)
+                if cached is not None:
+                    return list(cached)
+                event = self._inflight.get(node.uid)
+                owner = event is None
+                if owner:
+                    event = self._inflight[node.uid] = threading.Event()
+                    seen = self._changes.get(node.uid, 0)
+            if not owner:
+                event.wait()
+                continue  # now cached, or the other lister failed and this caller tries itself
+            try:
+                kids = sorted(self.backend.children(node.uid), key=lambda n: n.name)
+                with self._lock:
+                    # Changed while listing (e.g. an upload finished)? Then loop and list again.
+                    if node.uid not in self._children and self._changes.get(node.uid, 0) == seen:
+                        self._children[node.uid] = kids
+                    self.listed += 1
+                    count = self.listed
+                if self.on_list:
+                    self.on_list(count)
+            finally:
+                with self._lock:
+                    self._inflight.pop(node.uid, None)
+                event.set()
 
-    def prefetch(self, folders: Iterable[Node], recursive: bool = True) -> None:
-        """List folders concurrently (breadth first when ``recursive``) so later walks hit the cache."""
-        level = [f for f in folders if f.is_dir]
+    def start_prefetch(self, folder: Node) -> None:
+        """List ``folder``'s whole tree in the background (see _Prefetcher). Returns immediately."""
+        if folder.is_dir:
+            self._prefetchers.append(_Prefetcher(self, folder, self.list_jobs))
+
+    def stop(self) -> None:
+        """Stop background listing (call before closing the backend)."""
+        for p in self._prefetchers:
+            p.stop()
+
+    def list_many(self, folders: Iterable[Node]) -> None:
+        """List several folders concurrently and wait for all of them."""
+        folders = [f for f in folders if f.is_dir]
+        if len(folders) <= 1:
+            for f in folders:
+                self.listdir(f)
+            return
         with ThreadPoolExecutor(max_workers=self.list_jobs) as ex:
-            while level:
-                listings = list(ex.map(self.listdir, level))  # cached folders return immediately
-                if not recursive:
-                    return
-                level = [k for kids in listings for k in kids if k.is_dir]
+            list(ex.map(self.listdir, folders))
 
     def lookup_many(self, paths: Iterable[str]) -> None:
         """Warm the cache for many paths at once, listing each depth level in parallel."""
@@ -71,7 +151,7 @@ class Drive:
                 by_depth.setdefault(i, set()).add("/" + "/".join(ps[:i]))
         for depth in sorted(by_depth):
             nodes = [n for n in (self._try_lookup(p) for p in by_depth[depth]) if n is not None and n.is_dir]
-            self.prefetch(nodes, recursive=False)
+            self.list_many(nodes)
 
     def _try_lookup(self, path: str) -> Optional[Node]:
         try:
@@ -105,8 +185,8 @@ class Drive:
 
     def walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
         """Yield (path, node) for every descendant of a folder, depth first, parents before children.
-        The whole tree is listed up front, in parallel."""
-        self.prefetch([node])
+        The tree is listed in parallel in the background, so results start arriving right away."""
+        self.start_prefetch(node)
         yield from self._walk(node, path)
 
     def _walk(self, node: Node, path: str) -> Iterator[tuple[str, Node]]:
@@ -138,7 +218,7 @@ class Drive:
 
     def mkdir(self, path: str, parents: bool = False) -> Node:
         """Create a folder. With ``parents``, create missing ancestors and accept an existing folder."""
-        with self._lock:
+        with self._mkdir_lock:
             parent_path, name = remote.split(path)
             if not name:
                 if parents:
@@ -158,7 +238,8 @@ class Drive:
                 raise PdriveError(f"{remote.normpath(path)}: File exists")
             node = self.backend.mkdir(parent.uid, name)
             self._add(parent, node)
-            self._children[node.uid] = []
+            with self._lock:
+                self._children[node.uid] = []
             return node
 
     def rename(self, path: str, new_name: str) -> Node:
